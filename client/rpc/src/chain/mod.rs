@@ -32,9 +32,8 @@ use rpc::{
 	futures::{stream, Future, Sink, Stream},
 };
 
-use sc_rpc_api::Subscriptions;
 use sc_client_api::{BlockchainEvents, light::{Fetcher, RemoteBlockchain}};
-use jsonrpc_pubsub::{typed::Subscriber, SubscriptionId};
+use jsonrpc_pubsub::{typed::Subscriber, SubscriptionId, manager::SubscriptionManager};
 use sp_rpc::{number::NumberOrHex, list::ListOrValue};
 use sp_runtime::{
 	generic::{BlockId, SignedBlock},
@@ -57,7 +56,7 @@ trait ChainBackend<Client, Block: BlockT>: Send + Sync + 'static
 	fn client(&self) -> &Arc<Client>;
 
 	/// Get subscriptions reference.
-	fn subscriptions(&self) -> &Subscriptions;
+	fn subscriptions(&self) -> &SubscriptionManager;
 
 	/// Tries to unwrap passed block hash, or uses best block hash otherwise.
 	fn unwrap_or_best(&self, hash: Option<Block::Hash>) -> Block::Hash {
@@ -76,17 +75,27 @@ trait ChainBackend<Client, Block: BlockT>: Send + Sync + 'static
 	/// Get hash of the n-th block in the canon chain.
 	///
 	/// By default returns latest block hash.
-	fn block_hash(
-		&self,
-		number: Option<NumberOrHex<NumberFor<Block>>>,
-	) -> Result<Option<Block::Hash>> {
-		Ok(match number {
-			None => Some(self.client().info().best_hash),
-			Some(num_or_hex) => self.client()
-				.header(BlockId::number(num_or_hex.to_number()?))
-				.map_err(client_err)?
-				.map(|h| h.hash()),
-		})
+	fn block_hash(&self, number: Option<NumberOrHex>) -> Result<Option<Block::Hash>> {
+		match number {
+			None => Ok(Some(self.client().info().best_hash)),
+			Some(num_or_hex) => {
+				use std::convert::TryInto;
+
+				// FIXME <2329>: Database seems to limit the block number to u32 for no reason
+				let block_num: u32 = num_or_hex.try_into().map_err(|_| {
+					Error::from(format!(
+						"`{:?}` > u32::max_value(), the max block number is u32.",
+						num_or_hex
+					))
+				})?;
+				let block_num = <NumberFor<Block>>::from(block_num);
+				Ok(self
+					.client()
+					.header(BlockId::number(block_num))
+					.map_err(client_err)?
+					.map(|h| h.hash()))
+			}
+		}
 	}
 
 	/// Get hash of the last finalized block in the canon chain.
@@ -97,7 +106,7 @@ trait ChainBackend<Client, Block: BlockT>: Send + Sync + 'static
 	/// All new head subscription
 	fn subscribe_all_heads(
 		&self,
-		_metadata: crate::metadata::Metadata,
+		_metadata: crate::Metadata,
 		subscriber: Subscriber<Block::Header>,
 	) {
 		subscribe_headers(
@@ -114,7 +123,7 @@ trait ChainBackend<Client, Block: BlockT>: Send + Sync + 'static
 	/// Unsubscribe from all head subscription.
 	fn unsubscribe_all_heads(
 		&self,
-		_metadata: Option<crate::metadata::Metadata>,
+		_metadata: Option<crate::Metadata>,
 		id: SubscriptionId,
 	) -> RpcResult<bool> {
 		Ok(self.subscriptions().cancel(id))
@@ -123,7 +132,7 @@ trait ChainBackend<Client, Block: BlockT>: Send + Sync + 'static
 	/// New best head subscription
 	fn subscribe_new_heads(
 		&self,
-		_metadata: crate::metadata::Metadata,
+		_metadata: crate::Metadata,
 		subscriber: Subscriber<Block::Header>,
 	) {
 		subscribe_headers(
@@ -141,7 +150,7 @@ trait ChainBackend<Client, Block: BlockT>: Send + Sync + 'static
 	/// Unsubscribe from new best head subscription.
 	fn unsubscribe_new_heads(
 		&self,
-		_metadata: Option<crate::metadata::Metadata>,
+		_metadata: Option<crate::Metadata>,
 		id: SubscriptionId,
 	) -> RpcResult<bool> {
 		Ok(self.subscriptions().cancel(id))
@@ -150,7 +159,7 @@ trait ChainBackend<Client, Block: BlockT>: Send + Sync + 'static
 	/// Finalized head subscription
 	fn subscribe_finalized_heads(
 		&self,
-		_metadata: crate::metadata::Metadata,
+		_metadata: crate::Metadata,
 		subscriber: Subscriber<Block::Header>,
 	) {
 		subscribe_headers(
@@ -167,7 +176,7 @@ trait ChainBackend<Client, Block: BlockT>: Send + Sync + 'static
 	/// Unsubscribe from finalized head subscription.
 	fn unsubscribe_finalized_heads(
 		&self,
-		_metadata: Option<crate::metadata::Metadata>,
+		_metadata: Option<crate::Metadata>,
 		id: SubscriptionId,
 	) -> RpcResult<bool> {
 		Ok(self.subscriptions().cancel(id))
@@ -177,7 +186,7 @@ trait ChainBackend<Client, Block: BlockT>: Send + Sync + 'static
 /// Create new state API that works on full node.
 pub fn new_full<Block: BlockT, Client>(
 	client: Arc<Client>,
-	subscriptions: Subscriptions,
+	subscriptions: SubscriptionManager,
 ) -> Chain<Block, Client>
 	where
 		Block: BlockT + 'static,
@@ -191,7 +200,7 @@ pub fn new_full<Block: BlockT, Client>(
 /// Create new state API that works on light node.
 pub fn new_light<Block: BlockT, Client, F: Fetcher<Block>>(
 	client: Arc<Client>,
-	subscriptions: Subscriptions,
+	subscriptions: SubscriptionManager,
 	remote_blockchain: Arc<dyn RemoteBlockchain<Block>>,
 	fetcher: Arc<F>,
 ) -> Chain<Block, Client>
@@ -221,7 +230,7 @@ impl<Block, Client> ChainApi<NumberFor<Block>, Block::Hash, Block::Header, Signe
 			Block: BlockT + 'static,
 			Client: HeaderBackend<Block> + BlockchainEvents<Block> + 'static,
 {
-	type Metadata = crate::metadata::Metadata;
+	type Metadata = crate::Metadata;
 
 	fn header(&self, hash: Option<Block::Hash>) -> FutureResult<Option<Block::Header>> {
 		self.backend.header(hash)
@@ -234,7 +243,7 @@ impl<Block, Client> ChainApi<NumberFor<Block>, Block::Hash, Block::Header, Signe
 
 	fn block_hash(
 		&self,
-		number: Option<ListOrValue<NumberOrHex<NumberFor<Block>>>>
+		number: Option<ListOrValue<NumberOrHex>>,
 	) -> Result<ListOrValue<Option<Block::Hash>>> {
 		match number {
 			None => self.backend.block_hash(None).map(ListOrValue::Value),
@@ -279,7 +288,7 @@ impl<Block, Client> ChainApi<NumberFor<Block>, Block::Hash, Block::Header, Signe
 /// Subscribe to new headers.
 fn subscribe_headers<Block, Client, F, G, S, ERR>(
 	client: &Arc<Client>,
-	subscriptions: &Subscriptions,
+	subscriptions: &SubscriptionManager,
 	subscriber: Subscriber<Block::Header>,
 	best_block_hash: G,
 	stream: F,
